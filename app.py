@@ -1,41 +1,41 @@
 import cv2
 import time
 import re
+import csv
+import os
+from datetime import datetime
 from dataclasses import dataclass
-from typing import Tuple, Dict, List
+from typing import Tuple, Dict, Optional, List
 import numpy as np
 import torch
 import easyocr
 from ultralytics import YOLO
-
 
 # ────────────────────────────────────────────────
 # CONFIGURATION
 # ────────────────────────────────────────────────
 
 @dataclass
-class Config:
-    RTSP_URL: int | str = 0                   # 0 = webcam, or "rtsp://..."
-    PLATE_MODEL: str = "best.engine"          # Your TensorRT engine file
+class Config: 
+    RTSP_URL: int = 0
+    PLATE_MODEL: str = "best.engine"          # TensorRT engine
     CONFIDENCE: float = 0.25
-    OCR_COOLDOWN_FRAMES: int = 30             # Less frequent OCR → lower CPU/GPU load
+    OCR_COOLDOWN_SECONDS: float = 0.5   
     MAX_PLATES_PER_FRAME: int = 5
-    TRACK_EXPIRY_FRAMES: int = 120
-    DEVICE: int = 0                           # GPU index for YOLO
+    TRACK_EXPIRY_FRAMES: int = 100
+    IOU_THRESHOLD: float = 0.4                # for future NMS if needed
+    PLATE_MIN_LEN: int = 6      # ← ADD
+    PLATE_MAX_LEN: int = 10     # ← ADD
+    DEVICE: int = 0                           # GPU index
     IMG_SIZE: int = 640
     USE_FP16: bool = True
     DISPLAY_WINDOW: bool = True
-    FPS_SMOOTHING: int = 10
-    MIN_PLATE_AREA: int = 1200                # Skip very small/distant plates
-    OCR_CONF_THRESHOLD: float = 0.45          # Minimum OCR confidence
-    OCR_ALLOWLIST: str = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ'  # Restrict charset
-
+    FPS_SMOOTHING: int = 10                   # simple moving average
 
 CONFIG = Config()
 
-
 # ────────────────────────────────────────────────
-# PLATE TRACKER (simple centroid-based)
+# PLATE TRACKER
 # ────────────────────────────────────────────────
 
 class PlateTracker:
@@ -45,7 +45,7 @@ class PlateTracker:
 
     def update(self, detections: List[Tuple[int, int, int, int]], frame_count: int) -> List[int]:
         """Returns list of active track IDs this frame"""
-        current_centers = [((x1 + x2) // 2, (y1 + y2) // 2) for x1, y1, x2, y2 in detections]
+        current_centers = [( (x1+x2)//2, (y1+y2)//2 ) for x1,y1,x2,y2 in detections]
         matched = set()
 
         for i, (cx, cy) in enumerate(current_centers):
@@ -57,7 +57,9 @@ class PlateTracker:
                     continue
                 px, py = track["center"]
                 dist = ((cx - px) ** 2 + (cy - py) ** 2) ** 0.5
-                if dist < 70 and dist < best_dist:  # generous distance threshold
+                x1, y1, x2, y2 = detections[i]
+                bbox_diag = ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5
+                if dist < bbox_diag * 0.5 and dist < best_dist:  # increased threshold slightly
                     best_dist = dist
                     best_pid = pid
 
@@ -74,13 +76,14 @@ class PlateTracker:
                     "center": (cx, cy),
                     "bbox": detections[i],
                     "text": "",
-                    "last_ocr": -999,
+                    "text_votes": {},
+                    "last_ocr_time": 0.0,
                     "last_seen": frame_count
                 }
                 matched.add(self.next_id)
                 self.next_id += 1
 
-        # Remove stale tracks
+        # Cleanup old tracks
         to_remove = [
             pid for pid, t in self.tracks.items()
             if frame_count - t["last_seen"] > CONFIG.TRACK_EXPIRY_FRAMES
@@ -89,51 +92,103 @@ class PlateTracker:
             del self.tracks[pid]
 
         return list(matched)
+    
+# ────────────────────────────────────────────────
+# PLATE LOGGER
+# ────────────────────────────────────────────────
 
+class PlateLogger:
+    def __init__(self, filepath: str = "plate_log.csv"):
+        self.filepath = filepath
+        self.records: Dict[str, dict] = {}  # keyed by plate text
+
+        # Create CSV with headers if it doesn't exist
+        if not os.path.exists(filepath):
+            with open(filepath, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "plate_number",
+                    "first_seen",
+                    "last_seen",
+                    "read_count",
+                    "best_confidence",
+                    "all_readings"
+                ])
+        print(f"📋 Plate log: {os.path.abspath(filepath)}")
+
+    def log(self, plate_text: str, confidence: float):
+        """Call this every time a plate is successfully read."""
+        if not plate_text:
+            return
+
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        if plate_text not in self.records:
+            # Brand new plate
+            self.records[plate_text] = {
+                "plate_number":   plate_text,
+                "first_seen":     now,
+                "last_seen":      now,
+                "read_count":     1,
+                "best_confidence": round(confidence, 3),
+                "all_readings":   [f"{now}(conf:{confidence:.2f})"]
+            }
+            print(f"🆕 New plate detected: {plate_text} at {now}")
+        else:
+            # Existing plate — update record
+            rec = self.records[plate_text]
+            rec["last_seen"]  = now
+            rec["read_count"] += 1
+            rec["all_readings"].append(f"{now}(conf:{confidence:.2f})")
+            if confidence > rec["best_confidence"]:
+                rec["best_confidence"] = round(confidence, 3)
+            print(f"🔄 Updated plate: {plate_text} | reads: {rec['read_count']} | best conf: {rec['best_confidence']}")
+
+        self._write_csv()
+
+    def _write_csv(self):
+        """Rewrite the full CSV with current records."""
+        with open(self.filepath, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "plate_number", "first_seen", "last_seen",
+                "read_count", "best_confidence", "all_readings"
+            ])
+            for rec in self.records.values():
+                writer.writerow([
+                    rec["plate_number"],
+                    rec["first_seen"],
+                    rec["last_seen"],
+                    rec["read_count"],
+                    rec["best_confidence"],
+                    " | ".join(rec["all_readings"])
+                ])
 
 # ────────────────────────────────────────────────
 # IMAGE PROCESSING UTILS
 # ────────────────────────────────────────────────
 
-def preprocess_plate(image: np.ndarray) -> np.ndarray | None:
-    """Improved preprocessing for license plate OCR"""
+def preprocess_plate(image: np.ndarray) -> np.ndarray:
+    """Prepare plate crop for OCR"""
     if image.size == 0:
         return None
 
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    gray = cv2.resize(gray, None, fx=1.6, fy=1.6, interpolation=cv2.INTER_CUBIC)
+    gray = cv2.resize(gray, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+    gray = cv2.bilateralFilter(gray, d=11, sigmaColor=17, sigmaSpace=17)
 
-    # Contrast enhancement
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    gray = clahe.apply(gray)
-
-    gray = cv2.bilateralFilter(gray, d=9, sigmaColor=15, sigmaSpace=15)
-
-    # Light sharpening
-    kernel = np.array([[-1, -1, -1], [-1, 9, -1], [-1, -1, -1]])
-    gray = cv2.filter2D(gray, -1, kernel)
-
-    # Binary threshold - most plates have dark text on light bg
-    thresh = cv2.adaptiveThreshold(
-        gray, 255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY,
-        blockSize=31,
-        C=2
-    )
-
-    return thresh
+    thresh_inv = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,cv2.THRESH_BINARY_INV, 31, 2)
+    thresh_norm = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,cv2.THRESH_BINARY, 31, 2)
+    return [thresh_inv, thresh_norm]   # return both, OCR loop will handle both
 
 
 def clean_plate_text(text: str) -> str:
-    """Clean and validate extracted plate text"""
+    """Normalize and validate plate string"""
     if not text:
         return ""
     text = text.upper()
     text = re.sub(r'[^A-Z0-9]', '', text)
-    # Most plates are 5–10 chars; adjust range as needed for your country
-    return text if 5 <= len(text) <= 10 else ""
-
+    return text if CONFIG.PLATE_MIN_LEN <= len(text) <= CONFIG.PLATE_MAX_LEN else ""
 
 # ────────────────────────────────────────────────
 # MAIN APPLICATION
@@ -142,17 +197,13 @@ def clean_plate_text(text: str) -> str:
 class LicensePlateRecognizer:
     def __init__(self):
         print("Loading models...")
-        # Explicitly set task='detect' to silence warning
-        self.detector = YOLO(CONFIG.PLATE_MODEL, task='detect')
-        self.ocr_reader = easyocr.Reader(
-            ['en'],
-            gpu=False,                  # OCR on CPU → frees GPU for faster YOLO inference
-            model_storage_directory=None  # default
-        )
+        self.detector = YOLO(CONFIG.PLATE_MODEL)
+        self.ocr_reader = easyocr.Reader(['en'], gpu=True)
         self.tracker = PlateTracker()
         self.frame_count = 0
         self.fps_history = []
-
+        self.logger = PlateLogger("plate_log.csv")
+        
     def run(self):
         cap = cv2.VideoCapture(CONFIG.RTSP_URL)
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
@@ -164,21 +215,28 @@ class LicensePlateRecognizer:
             return
 
         print("Stream opened. Press 'q' to quit.")
-
+        retries = 0
+        MAX_RETRIES = 5
         while True:
             ret, frame = cap.read()
+            if ret:
+                retries = 0
             if not ret:
-                print("Stream interrupted. Reconnecting...")
+                retries += 1
+                print(f"Stream interrupted. Retry {retries}/{MAX_RETRIES}...")
                 cap.release()
+                if retries > MAX_RETRIES:
+                    print("Stream unavailable. Exiting.")
+                    break
+                time.sleep(min(2 ** retries, 30))
                 cap = cv2.VideoCapture(CONFIG.RTSP_URL)
                 cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
-                time.sleep(1.5)
                 continue
 
             self.frame_count += 1
             start_time = time.time()
 
-            # ── YOLO Detection ───────────────────────────────────
+            # ── Detection ────────────────────────────────────────
             results = self.detector(
                 frame,
                 conf=CONFIG.CONFIDENCE,
@@ -188,15 +246,16 @@ class LicensePlateRecognizer:
                 verbose=False
             )
 
+            # Collect bounding boxes this frame
             current_detections = []
             for r in results:
-                for box in r.boxes.xyxy:
+                for box in r.boxes.xyxy.cpu().numpy():
                     current_detections.append(tuple(map(int, box)))
 
             # ── Tracking ─────────────────────────────────────────
             active_pids = self.tracker.update(current_detections, self.frame_count)
 
-            # ── OCR + Drawing ────────────────────────────────────
+            # ── OCR & Drawing ────────────────────────────────────
             plates_processed = 0
 
             for pid in active_pids:
@@ -205,62 +264,69 @@ class LicensePlateRecognizer:
 
                 track = self.tracker.tracks[pid]
                 x1, y1, x2, y2 = track["bbox"]
+                h, w = frame.shape[:2]
+                x1, y1 = max(0, x1), max(0, y1)   
+                x2, y2 = min(w, x2), min(h, y2)
                 crop = frame[y1:y2, x1:x2]
 
-                # Skip tiny detections
-                plate_area = (x2 - x1) * (y2 - y1)
-                if plate_area < CONFIG.MIN_PLATE_AREA:
-                    continue
-
-                should_ocr = (self.frame_count - track["last_ocr"]) > CONFIG.OCR_COOLDOWN_FRAMES
+                # OCR trigger
+                should_ocr = (time.time() - track.get("last_ocr_time", 0)) > CONFIG.OCR_COOLDOWN_SECONDS
                 plate_text = track["text"]
 
                 if should_ocr and crop.size > 0:
-                    processed = preprocess_plate(crop)
-                    if processed is not None:
-                        try:
-                            ocr_results = self.ocr_reader.readtext(
-                                processed,
-                                detail=1,
-                                paragraph=False,
-                                allowlist=CONFIG.OCR_ALLOWLIST,
-                                contrast_ths=0.1,
-                                adjust_contrast=0.5,
-                                text_threshold=0.7,
-                                low_text=0.4
-                            )
+                    best_candidate, best_conf = "", 0.0
+                    preprocessed = preprocess_plate(crop)
+                    for img in [crop] + (preprocessed if isinstance(preprocessed, list) else [preprocessed]):
+                        if img is None or img.size == 0:
+                            continue
+                        ocr_result = self.ocr_reader.readtext(img, detail=1, paragraph=False,
+                                    allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789')
+                        if ocr_result:
+                            text, conf = ocr_result[0][1], ocr_result[0][2]
+                            candidate = clean_plate_text(text)
+                            if candidate and conf > best_conf:
+                                best_candidate, best_conf = candidate, conf
+                    if best_candidate:
+                        votes = track.setdefault("text_votes", {})
+                        votes[best_candidate] = votes.get(best_candidate, 0) + 1
+                        best_voted = max(votes, key=votes.get)
+                        if votes[best_voted] >= 2:
+                            track["text"] = best_voted
+                            plate_text = best_voted
+                            self.logger.log(best_voted, best_conf)
+                        track["last_ocr_time"] = time.time()
+                for img in [crop] + (preprocessed if isinstance(preprocessed, list) else [preprocessed]):
+                    if img is None or img.size == 0:
+                        continue
+                    ocr_result = self.ocr_reader.readtext(img, detail=1, paragraph=False,
+                                allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789')
+                    if ocr_result:
+                        text, conf = ocr_result[0][1], ocr_result[0][2]
+                        candidate = clean_plate_text(text)
+                        if candidate and conf > best_conf:
+                            best_candidate, best_conf = candidate, conf
+                if best_candidate:
+                    votes = track.setdefault("text_votes", {})
+                    votes[best_candidate] = votes.get(best_candidate, 0) + 1
+                    best_voted = max(votes, key=votes.get)
+                    if votes[best_voted] >= 2:          # confirmed after 2 consistent reads
+                        track["text"] = best_voted
+                        plate_text = best_voted
+                    track["last_ocr_time"] = time.time()
 
-                            candidates = []
-                            for res in ocr_results:
-                                _, text, conf = res
-                                if conf >= CONFIG.OCR_CONF_THRESHOLD:
-                                    cleaned = clean_plate_text(text)
-                                    if cleaned:
-                                        candidates.append((cleaned, conf))
-
-                            if candidates:
-                                # Best = highest confidence, tiebreaker = longest
-                                best = max(candidates, key=lambda x: (x[1], len(x[0])))
-                                track["text"] = best[0]
-                                track["last_ocr"] = self.frame_count
-                                plate_text = best[0]
-
-                        except Exception as e:
-                            print(f"OCR failed on plate #{pid}: {e}")
-
-                # ── Draw ─────────────────────────────────────────
+                # Draw
                 color = (0, 255, 0) if plate_text else (0, 165, 255)
                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
 
                 label = f"#{pid}"
                 if plate_text:
                     label += f"  {plate_text}"
-                cv2.putText(frame, label, (x1, y1 - 12),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.75, color, 2)
+                cv2.putText(frame, label, (x1, y1 - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
 
                 plates_processed += 1
 
-            # ── FPS display ──────────────────────────────────────
+            # ── FPS ──────────────────────────────────────────────
             elapsed = time.time() - start_time
             instant_fps = 1 / elapsed if elapsed > 0 else 0
             self.fps_history.append(instant_fps)
@@ -269,7 +335,7 @@ class LicensePlateRecognizer:
             avg_fps = sum(self.fps_history) / len(self.fps_history) if self.fps_history else 0
 
             cv2.putText(frame, f"FPS: {int(avg_fps)}", (20, 40),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 100), 2)
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 100), 2)
 
             if CONFIG.DISPLAY_WINDOW:
                 cv2.imshow("License Plate Recognition", frame)
@@ -280,7 +346,6 @@ class LicensePlateRecognizer:
         cap.release()
         cv2.destroyAllWindows()
         print(f"Processed {self.frame_count} frames. Exiting.")
-
 
 # ────────────────────────────────────────────────
 # ENTRY POINT
